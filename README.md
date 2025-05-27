@@ -33,7 +33,7 @@ Jerzy is a lightweight, modular Python framework for building explainable and au
 ## Installation
 
 ```bash
-pip install jerzy
+pip install git+https://github.com/JerzyKultura/Jerzy.git
 ```
 
 ## Core Concepts
