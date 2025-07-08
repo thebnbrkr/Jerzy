@@ -675,25 +675,44 @@ class Agent:
 
 
 
+# REPLACE the ConversationalAgent class in your agent.py with this enhanced version
+
 class ConversationalAgent(Agent):
-    """Agent specialized for multi-turn conversational interactions."""
+    """Agent specialized for multi-turn conversational interactions with audit trail support."""
 
     def __init__(self, llm: LLM, system_prompt: Optional[str] = None,
                  cache_ttl: Optional[int] = 3600, cache_size: int = 100,
-                 use_vector_memory: bool = False):
-        super().__init__(llm, system_prompt, cache_ttl, cache_size)
+                 use_vector_memory: bool = False, enable_auditing: bool = True):
+        
+        # FIXED: Pass enable_auditing to parent class
+        super().__init__(llm, system_prompt, cache_ttl, cache_size, enable_auditing)
+        
         self.conversation = ConversationChain(
             llm,
-            EnhancedMemory(),
+            EnhancedMemory(),  # Already uses enhanced memory!
             system_prompt or "You are a helpful assistant that remembers previous interactions."
         )
 
         if use_vector_memory:
             self.init_vector_memory()
 
+    def init_vector_memory(self):
+        """Initialize vector-based semantic memory (placeholder for future vector DB integration)."""
+        print("Vector memory initialized (using enhanced keyword search)")
+
     def chat(self, message: str, thread_id: str = "default",
              use_search: bool = True, context_window: int = 10) -> str:
-        """Chat with the agent, maintaining conversation history."""
+        """Chat with the agent, maintaining conversation history with audit trail logging."""
+        
+        # Log the incoming chat to audit trail
+        if hasattr(self, 'audit_trail') and self.audit_trail:
+            self.audit_trail.log_custom("chat_message_received", {
+                "thread_id": thread_id,
+                "message": message,
+                "use_search": use_search,
+                "context_window": context_window
+            })
+        
         # First try to use tools if needed
         if self.tools and len(self.tools) > 0:
             # Create a message format that includes history and the current message
@@ -718,7 +737,20 @@ class ConversationalAgent(Agent):
                 if tool:
                     # Execute the tool
                     cache_to_use = self.cache if hasattr(self, 'cache') else None
+                    tool_start_time = time.time()
                     tool_result = tool(cache=cache_to_use, **tool_args)
+                    tool_latency = time.time() - tool_start_time
+
+                    # Log tool call to audit trail
+                    if hasattr(self, 'audit_trail') and self.audit_trail:
+                        self.audit_trail.log_tool_call(
+                            tool_name,
+                            tool_args,
+                            tool_result,
+                            latency=tool_latency,
+                            cached=tool_result.get("cached", False),
+                            metadata={"thread_id": thread_id, "context": "conversational_chat"}
+                        )
 
                     # Record the tool call
                     self.conversation.add_message(
@@ -734,6 +766,13 @@ class ConversationalAgent(Agent):
                             thread_id,
                             {"type": "reasoning"}
                         )
+                        
+                        # Log reasoning to audit trail
+                        if hasattr(self, 'audit_trail') and self.audit_trail:
+                            self.audit_trail.log_reasoning(
+                                tool_reasoning,
+                                metadata={"tool": tool_name, "thread_id": thread_id}
+                            )
 
                     # Record the tool result
                     cache_notice = " (from cache)" if tool_result.get("cached", False) else ""
@@ -748,30 +787,65 @@ class ConversationalAgent(Agent):
                         "content": "Based on the tool results above, provide a helpful response to the user."
                     })
 
+                    response_start_time = time.time()
                     final_response = self.llm.generate(messages)
+                    response_latency = time.time() - response_start_time
+                    
                     self.conversation.add_message("assistant", final_response, thread_id)
+
+                    # Log final response to audit trail
+                    if hasattr(self, 'audit_trail') and self.audit_trail:
+                        self.audit_trail.log_custom("conversational_response", {
+                            "thread_id": thread_id,
+                            "response": final_response,
+                            "tool_used": tool_name,
+                            "latency": response_latency
+                        })
 
                     return final_response
 
             # If we didn't use a tool, continue with normal conversation flow
 
         # Normal conversation flow (no tools needed)
+        response_start_time = time.time()
         if use_search:
-            return self.conversation.search_and_respond(
+            response = self.conversation.search_and_respond(
                 message, thread_id, context_window
             )
         else:
-            return self.conversation.generate_response(
+            response = self.conversation.generate_response(
                 message, thread_id, context_window
             )
+        response_latency = time.time() - response_start_time
+        
+        # Log conversation response to audit trail
+        if hasattr(self, 'audit_trail') and self.audit_trail:
+            self.audit_trail.log_custom("conversational_response", {
+                "thread_id": thread_id,
+                "user_message": message,
+                "assistant_response": response,
+                "use_search": use_search,
+                "context_window": context_window,
+                "latency": response_latency,
+                "tool_used": None
+            })
+        
+        return response
 
     def start_new_conversation(self, thread_id: str = None) -> str:
-        """Start a new conversation thread."""
+        """Start a new conversation thread with audit logging."""
         if thread_id is None:
             thread_id = f"conversation_{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
         # Create the new thread
         self.conversation.memory.threads[thread_id] = []
+        
+        # Log conversation start to audit trail
+        if hasattr(self, 'audit_trail') and self.audit_trail:
+            self.audit_trail.log_custom("conversation_started", {
+                "thread_id": thread_id,
+                "timestamp": datetime.now().isoformat()
+            })
 
         return thread_id
 
@@ -824,8 +898,105 @@ class ConversationalAgent(Agent):
 
         return history
 
+    def remember(self, key: str, value: Any, thread_id: str = "default") -> None:
+        """Explicitly store information in memory with audit logging."""
+        # Store in enhanced memory
+        self.conversation.memory.set(key, value)
+        
+        # Add a system note about this storage
+        self.conversation.add_message(
+            "system",
+            f"Remembered: {key} = {str(value)}",
+            thread_id,
+            {"type": "memory_storage", "key": key}
+        )
+        
+        # Log to audit trail
+        if hasattr(self, 'audit_trail') and self.audit_trail:
+            self.audit_trail.log_custom("memory_storage", {
+                "key": key,
+                "value": str(value),
+                "thread_id": thread_id
+            })
 
+    def recall(self, key: str, default: Any = None) -> Any:
+        """Recall information from memory."""
+        value = self.conversation.memory.get(key, default)
+        
+        # Log recall to audit trail
+        if hasattr(self, 'audit_trail') and self.audit_trail:
+            self.audit_trail.log_custom("memory_recall", {
+                "key": key,
+                "value": str(value) if value is not None else None,
+                "found": value is not None
+            })
+        
+        return value
 
+    def search_memory(self, query: str, top_k: int = 5, thread_id: str = None) -> List[Dict[str, Any]]:
+        """Search memory for relevant information with audit logging."""
+        results = self.conversation.memory.find_relevant(query, top_k)
+        
+        # Log search to audit trail
+        if hasattr(self, 'audit_trail') and self.audit_trail:
+            self.audit_trail.log_custom("memory_search", {
+                "query": query,
+                "top_k": top_k,
+                "results_count": len(results),
+                "thread_id": thread_id
+            })
+        
+        return results
+
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """Get statistics about memory usage."""
+        total_messages = len(self.conversation.memory.history)
+        total_threads = len(self.conversation.memory.threads)
+        
+        # Count message types
+        type_counts = {}
+        for msg in self.conversation.memory.history:
+            msg_type = msg.get("type", msg.get("role", "unknown"))
+            type_counts[msg_type] = type_counts.get(msg_type, 0) + 1
+        
+        # Get indexed words count
+        indexed_words = len(self.conversation.memory.indexed_content)
+        
+        return {
+            "total_messages": total_messages,
+            "total_threads": total_threads,
+            "message_types": type_counts,
+            "indexed_words": indexed_words,
+            "has_audit_trail": hasattr(self, 'audit_trail') and self.audit_trail is not None
+        }
+
+    def start_audit_session(self, metadata: Optional[Dict[str, Any]] = None) -> str:
+        """Start a new audit session for this conversational agent."""
+        if hasattr(self, 'audit_trail') and self.audit_trail:
+            session_metadata = {
+                "agent_type": "ConversationalAgent",
+                "system_prompt": self.system_prompt,
+                "tools_available": [tool.name for tool in self.tools],
+                **(metadata or {})
+            }
+            return self.audit_trail.start_session(session_metadata)
+        return None
+
+    def get_audit_summary(self) -> Optional[Dict[str, Any]]:
+        """Get audit trail summary with conversation-specific metrics."""
+        if hasattr(self, 'audit_trail') and self.audit_trail:
+            summary = self.audit_trail.get_summary()
+            
+            # Add conversation-specific metrics
+            memory_stats = self.get_memory_stats()
+            summary["conversation_metrics"] = {
+                "total_threads": memory_stats["total_threads"],
+                "total_messages": memory_stats["total_messages"],
+                "message_types": memory_stats["message_types"]
+            }
+            
+            return summary
+        return None
 
 class EnhancedAgent(Agent):
     """Agent with explicit planning capabilities."""
@@ -1230,4 +1401,3 @@ class MultiAgentSystem:
             "conversation": [msg.to_dict() for msg in self.conversation],
             "conclusion": conclusion
         }
-
