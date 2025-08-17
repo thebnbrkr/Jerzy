@@ -1,3 +1,5 @@
+# agent.py - Central LLM-powered agent interface
+
 from jerzy.common import *
 
 from typing import List, Any, Optional, Union, Dict
@@ -6,55 +8,10 @@ from .trace import Trace, AuditTrail, Plan, Planner
 from .memory import Memory, EnhancedMemory
 from .chain import Chain, ConversationChain
 from .llm import LLM, OpenAILLM, CustomOpenAILLM
+from .replay import Cassette, ReplayableAgent  # NEW IMPORT
 
 
-# Import ReplayableAgent at the module level to avoid circular imports
-class ReplayableAgent:
-    """Mixin to add replay capabilities to any Agent class."""
-    
-    def enable_replay(self, cassette_path: str = None, mode: str = "auto"):
-        """Enable cassette-based replay for this agent."""
-        # Import here to avoid circular imports
-        from .replay import Cassette
-        
-        self.cassette = Cassette(cassette_path, mode)
-        
-        # Monkey-patch the LLM's generate method
-        original_generate = self.llm.generate
-        
-        def replay_aware_generate(prompt, **kwargs):
-            # Try to get from cassette first
-            model = getattr(self.llm, 'model', 'unknown')
-            replayed = self.cassette.intercept_llm_call(prompt, model, **kwargs)
-            
-            if replayed is not None:
-                return replayed
-            
-            # Make real call
-            response = original_generate(prompt, **kwargs)
-            
-            # Record for future replay
-            self.cassette.record_llm_response(prompt, model, response, **kwargs)
-            
-            return response
-        
-        self.llm.generate = replay_aware_generate
-        
-        # Also patch generate_with_tools if it exists
-        if hasattr(self.llm, 'generate_with_tools'):
-            original_generate_with_tools = self.llm.generate_with_tools
-            
-            def replay_aware_generate_with_tools(prompt, tools, **kwargs):
-                # For now, just call original - full tool replay is complex
-                return original_generate_with_tools(prompt, tools, **kwargs)
-            
-            self.llm.generate_with_tools = replay_aware_generate_with_tools
-        
-        print(f"🎬 Replay enabled: mode='{mode}', cassette='{cassette_path or 'cassette.jsonl'}'")
-        return self.cassette
-
-
-class Agent(ReplayableAgent):
+class Agent(ReplayableAgent):  # CHANGED: Now inherits from ReplayableAgent
     """Enhanced LLM-powered agent with transparency, reasoning, caching, and replay capabilities."""
 
     def __init__(self, llm: LLM, system_prompt: Optional[str] = None,
@@ -68,7 +25,7 @@ class Agent(ReplayableAgent):
         self.cache = ToolCache(max_size=cache_size, ttl=cache_ttl)
         self.state = State()
         self.tool_call_history = []
-        self.cassette = None  # Will be set if replay is enabled
+        self.cassette = None  # NEW: Will be set if replay is enabled
 
         # Initialize audit trail if enabled
         if enable_auditing:
@@ -120,7 +77,7 @@ class Agent(ReplayableAgent):
             if tool.name not in {t.name for t in self.tools}:
                 self.tools.append(tool)
                 
-                # If we have a cassette, wrap the tool for replay
+                # NEW: If we have a cassette, wrap the tool for replay
                 if hasattr(self, 'cassette') and self.cassette:
                     original_func = tool.func
                     
@@ -139,8 +96,6 @@ class Agent(ReplayableAgent):
                     
                     tool.func = replay_aware_tool_func
 
-    # ... rest of the Agent class methods remain the same ...
-    
     def chat(self, user_message: str, thread_id: str = "default",
              use_semantic_search: bool = False, context_window: int = 10) -> str:
         """Have a conversation with the agent, with memory of past interactions."""
@@ -232,7 +187,7 @@ class Agent(ReplayableAgent):
                 "reasoning_mode": reasoning_mode,
                 "use_cache": use_cache,
                 "system_prompt": self.system_prompt,
-                "replay_enabled": hasattr(self, 'cassette') and self.cassette is not None
+                "replay_enabled": hasattr(self, 'cassette') and self.cassette is not None  # NEW
             })
 
         # Initialize state with query
@@ -447,7 +402,7 @@ class Agent(ReplayableAgent):
                         # Execute the tool (or get cached result)
                         tool_start_time = time.time()
                         
-                        # Check cassette first if replay is enabled
+                        # NEW: Check cassette first if replay is enabled
                         if hasattr(self, 'cassette') and self.cassette:
                             replayed = self.cassette.intercept_tool_call(tool_name, tool_args)
                             if replayed is not None:
@@ -573,6 +528,75 @@ class Agent(ReplayableAgent):
                             "timestamp": datetime.now().isoformat()
                         })
 
+                        # After getting the tool result, ask the model to reflect on what it learned
+                        if step < max_steps - 1:  # Don't do this for the final step to save tokens
+                            try:
+                                # Adjust reflection level based on reasoning mode
+                                if reasoning_mode == "short":
+                                    reflection_prompt = [
+                                        {"role": "system",
+                                         "content": "In 1-2 sentences, what did you learn from this result?"},
+                                        {"role": "user",
+                                         "content": f"Tool: {tool_name}, Result summary: {str(tool_result)[:100]}..."}
+                                    ]
+                                elif reasoning_mode == "medium":
+                                    reflection_prompt = [
+                                        {"role": "system",
+                                         "content": "In 3-6 sentences, how does this result help answer the query?"},
+                                        {"role": "user",
+                                         "content": f"Original query: {user_query}\nTool: {tool_name}\nResult summary: {str(tool_result)[:200]}..."}
+                                    ]
+                                else:  # "full"
+                                    reflection_prompt = [
+                                        {"role": "system",
+                                         "content": "Based on the tool's result, reflect on what you've learned and how it helps answer the original query."},
+                                        {"role": "user",
+                                         "content": f"Original query: {user_query}\nTool used: {tool_name}\nTool result: {tool_result}\n\nReflect on what you've learned:"}
+                                    ]
+
+                                reflection_start_time = time.time()
+                                reflection = self.llm.generate(reflection_prompt)
+                                reflection_latency = time.time() - reflection_start_time
+
+                                if verbose:
+                                    print(f"🧠 Reflection: {reflection}")
+
+                                # Store reflection in memory and state
+                                self.memory.add_to_history({
+                                    "role": "assistant",
+                                    "content": f"Reflection: {reflection}",
+                                    "type": "reflection",
+                                    "timestamp": datetime.now().isoformat()
+                                })
+
+                                # Track reflection in state
+                                self.state.append_to("execution.reflections", {
+                                    "tool": tool_name,
+                                    "content": reflection,
+                                    "step": step,
+                                    "timestamp": datetime.now().isoformat()
+                                })
+
+                                # Log reflection to audit trail if available
+                                if hasattr(self, 'audit_trail') and self.audit_trail:
+                                    self.audit_trail.log_custom("reflection", {
+                                        "content": reflection,
+                                        "tool": tool_name,
+                                        "step": step,
+                                        "latency": reflection_latency
+                                    })
+                            except Exception as e:
+                                if verbose:
+                                    print(f"⚠️ Error getting reflection: {str(e)}")
+
+                                # Log error to audit trail if available
+                                if hasattr(self, 'audit_trail') and self.audit_trail:
+                                    self.audit_trail.log_error(
+                                        "reflection_error",
+                                        str(e),
+                                        context={"tool": tool_name, "step": step}
+                                    )
+
                         step += 1
                         continue
 
@@ -665,7 +689,7 @@ class Agent(ReplayableAgent):
         # Update step in state
         self.state.set("execution.total_steps", step)
 
-        # Log replay stats if available
+        # NEW: Log replay stats if available
         if hasattr(self, 'cassette') and self.cassette:
             replay_stats = self.cassette.get_stats()
             if verbose:
@@ -678,7 +702,7 @@ class Agent(ReplayableAgent):
                 "steps_taken": step,
                 "duration": run_duration,
                 "token_usage": self.llm.get_token_usage(),
-                "replay_stats": self.get_replay_stats() if hasattr(self, 'cassette') else None
+                "replay_stats": self.get_replay_stats() if hasattr(self, 'cassette') else None  # NEW
             })
 
             # Save the audit trail to file if storage_path is set
@@ -698,7 +722,7 @@ class Agent(ReplayableAgent):
                 "state": self.state.to_dict(),
                 "audit_trail": self.audit_trail.get_summary() if hasattr(self,
                                                                          'audit_trail') and self.audit_trail else None,
-                "replay_stats": self.get_replay_stats()
+                "replay_stats": self.get_replay_stats()  # NEW
             }
         else:
             # Return simple response and history
@@ -706,8 +730,7 @@ class Agent(ReplayableAgent):
 
 
 # The rest of the classes remain the same (ConversationalAgent, EnhancedAgent, etc.)
-# Just keeping the basic structure here for brevity
-
+# No changes needed for those classes
 
 class ConversationalAgent(Agent):
     """Agent specialized for multi-turn conversational interactions with audit trail support."""
