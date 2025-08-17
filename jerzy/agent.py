@@ -2,17 +2,17 @@
 
 from jerzy.common import *
 
-
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Union, Dict
 from .core import ToolCache, State, Tool
 from .trace import Trace, AuditTrail, Plan, Planner
 from .memory import Memory, EnhancedMemory
 from .chain import Chain, ConversationChain
 from .llm import LLM, OpenAILLM, CustomOpenAILLM
+from .replay import Cassette, ReplayableAgent  # NEW IMPORT
 
 
-class Agent:
-    """Enhanced LLM-powered agent with transparency, reasoning, and caching capabilities."""
+class Agent(ReplayableAgent):  # CHANGED: Now inherits from ReplayableAgent
+    """Enhanced LLM-powered agent with transparency, reasoning, caching, and replay capabilities."""
 
     def __init__(self, llm: LLM, system_prompt: Optional[str] = None,
                  cache_ttl: Optional[int] = 3600, cache_size: int = 100,
@@ -25,6 +25,7 @@ class Agent:
         self.cache = ToolCache(max_size=cache_size, ttl=cache_ttl)
         self.state = State()
         self.tool_call_history = []
+        self.cassette = None  # NEW: Will be set if replay is enabled
 
         # Initialize audit trail if enabled
         if enable_auditing:
@@ -35,6 +36,18 @@ class Agent:
         else:
             self.audit_trail = None
 
+    def with_replay(self, cassette_path: str = None, mode: str = "auto") -> 'Agent':
+        """Enable replay mode for deterministic testing.
+        
+        Args:
+            cassette_path: Path to cassette file for recording/replaying
+            mode: "record", "replay", or "auto" (default)
+        
+        Returns:
+            Self for method chaining
+        """
+        self.enable_replay(cassette_path, mode)
+        return self
 
     def _compare_args(self, args1: dict, args2: dict) -> bool:
         """Compare two argument dictionaries to detect duplicate tool calls."""
@@ -63,6 +76,25 @@ class Agent:
         for tool in tools:
             if tool.name not in {t.name for t in self.tools}:
                 self.tools.append(tool)
+                
+                # NEW: If we have a cassette, wrap the tool for replay
+                if hasattr(self, 'cassette') and self.cassette:
+                    original_func = tool.func
+                    
+                    def replay_aware_tool_func(*args, **kwargs):
+                        # Try to get from cassette first
+                        replayed = self.cassette.intercept_tool_call(tool.name, kwargs)
+                        if replayed is not None:
+                            return replayed
+                        
+                        # Make real call
+                        result = original_func(*args, **kwargs)
+                        
+                        # Record for future replay
+                        self.cassette.record_tool_response(tool.name, kwargs, result)
+                        return result
+                    
+                    tool.func = replay_aware_tool_func
 
     def chat(self, user_message: str, thread_id: str = "default",
              use_semantic_search: bool = False, context_window: int = 10) -> str:
@@ -134,6 +166,12 @@ class Agent:
         if hasattr(self, 'audit_trail') and self.audit_trail:
             return self.audit_trail.save(filepath)
         return None
+    
+    def get_replay_stats(self) -> Optional[Dict[str, Any]]:
+        """Get statistics about replay/cassette usage."""
+        if hasattr(self, 'cassette') and self.cassette:
+            return self.cassette.get_stats()
+        return None
 
     def run(self, user_query: str, max_steps: int = 5, verbose: bool = False,
             return_trace: bool = False, use_cache: bool = True,
@@ -148,7 +186,8 @@ class Agent:
                 "max_steps": max_steps,
                 "reasoning_mode": reasoning_mode,
                 "use_cache": use_cache,
-                "system_prompt": self.system_prompt
+                "system_prompt": self.system_prompt,
+                "replay_enabled": hasattr(self, 'cassette') and self.cassette is not None  # NEW
             })
 
         # Initialize state with query
@@ -362,7 +401,18 @@ class Agent:
 
                         # Execute the tool (or get cached result)
                         tool_start_time = time.time()
-                        tool_result = tool(cache=cache_to_use, **tool_args)
+                        
+                        # NEW: Check cassette first if replay is enabled
+                        if hasattr(self, 'cassette') and self.cassette:
+                            replayed = self.cassette.intercept_tool_call(tool_name, tool_args)
+                            if replayed is not None:
+                                tool_result = replayed
+                            else:
+                                tool_result = tool(cache=cache_to_use, **tool_args)
+                                self.cassette.record_tool_response(tool_name, tool_args, tool_result)
+                        else:
+                            tool_result = tool(cache=cache_to_use, **tool_args)
+                        
                         tool_latency = time.time() - tool_start_time
 
                         # Record in tool call history to prevent repetition
@@ -639,13 +689,20 @@ class Agent:
         # Update step in state
         self.state.set("execution.total_steps", step)
 
+        # NEW: Log replay stats if available
+        if hasattr(self, 'cassette') and self.cassette:
+            replay_stats = self.cassette.get_stats()
+            if verbose:
+                print(f"📼 Replay stats: {replay_stats['hits']} hits, {replay_stats['misses']} misses")
+
         # Log run completion to audit trail if available
         if hasattr(self, 'audit_trail') and self.audit_trail:
             run_duration = time.time() - run_start_time
             self.audit_trail.log_custom("run_complete", {
                 "steps_taken": step,
                 "duration": run_duration,
-                "token_usage": self.llm.get_token_usage()
+                "token_usage": self.llm.get_token_usage(),
+                "replay_stats": self.get_replay_stats() if hasattr(self, 'cassette') else None  # NEW
             })
 
             # Save the audit trail to file if storage_path is set
@@ -664,18 +721,16 @@ class Agent:
                 "unique_tool_results": self.memory.get_unique_tool_results(),
                 "state": self.state.to_dict(),
                 "audit_trail": self.audit_trail.get_summary() if hasattr(self,
-                                                                         'audit_trail') and self.audit_trail else None
+                                                                         'audit_trail') and self.audit_trail else None,
+                "replay_stats": self.get_replay_stats()  # NEW
             }
         else:
             # Return simple response and history
             return final_response, self.memory.history
 
 
-
-
-
-
-# REPLACE the ConversationalAgent class in your agent.py with this enhanced version
+# The rest of the classes remain the same (ConversationalAgent, EnhancedAgent, etc.)
+# No changes needed for those classes
 
 class ConversationalAgent(Agent):
     """Agent specialized for multi-turn conversational interactions with audit trail support."""
@@ -998,6 +1053,7 @@ class ConversationalAgent(Agent):
             return summary
         return None
 
+
 class EnhancedAgent(Agent):
     """Agent with explicit planning capabilities."""
 
@@ -1058,6 +1114,7 @@ class EnhancedAgent(Agent):
             "execution_result": execution_result,
             "summary": summary
         }
+
 
 class AgentRole:
     """Defines a specialized role for an agent in a multi-agent system."""
