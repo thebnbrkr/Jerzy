@@ -11,7 +11,7 @@ from .llm import LLM, OpenAILLM, CustomOpenAILLM
 from .replay import Cassette, ReplayableAgent  # NEW IMPORT
 
 
-class Agent(ReplayableAgent):  # CHANGED: Now inherits from ReplayableAgent
+class Agent(ReplayableAgent):  # Inherits from ReplayableAgent
     """Enhanced LLM-powered agent with transparency, reasoning, caching, and replay capabilities."""
 
     def __init__(self, llm: LLM, system_prompt: Optional[str] = None,
@@ -25,7 +25,7 @@ class Agent(ReplayableAgent):  # CHANGED: Now inherits from ReplayableAgent
         self.cache = ToolCache(max_size=cache_size, ttl=cache_ttl)
         self.state = State()
         self.tool_call_history = []
-        self.cassette = None  # NEW: Will be set if replay is enabled
+        self.cassette = None  # Will be set if replay is enabled
 
         # Initialize audit trail if enabled
         if enable_auditing:
@@ -36,62 +36,69 @@ class Agent(ReplayableAgent):  # CHANGED: Now inherits from ReplayableAgent
         else:
             self.audit_trail = None
 
-    def with_replay(self, cassette_path: str = None, mode: str = "auto") -> 'Agent':
+    def with_replay(self, cassette_path: str = None, mode: str = "auto", verbose: bool = False) -> 'Agent':
         """Enable replay mode for deterministic testing.
         
         Args:
             cassette_path: Path to cassette file for recording/replaying
             mode: "record", "replay", or "auto" (default)
+            verbose: Whether to print debug messages
         
         Returns:
             Self for method chaining
         """
-        self.enable_replay(cassette_path, mode)
+        self.enable_replay(cassette_path, mode, verbose)
         return self
 
     def _compare_args(self, args1: dict, args2: dict) -> bool:
         """Compare two argument dictionaries to detect duplicate tool calls."""
         try:
-            # Simple comparison - convert to JSON strings and compare
             import json
-
             # Sort keys to ensure consistent comparison
             json1 = json.dumps(args1, sort_keys=True)
             json2 = json.dumps(args2, sort_keys=True)
-
             return json1 == json2
-
         except Exception:
             # Fallback to basic dict comparison if JSON serialization fails
             return args1 == args2
 
     def _extract_info_from_tool_result(self, tool_name: str, tool_args: dict, tool_result: dict) -> None:
         """Optionally extract structured insights from tool results for future use (e.g., memory, trace)."""
-
         if not hasattr(self, "memory") or not isinstance(tool_result, dict):
             return
 
     def add_tools(self, tools: List[Any]) -> None:
         """Register a list of tools with the agent, avoiding duplicates."""
+        import functools
+        
         for tool in tools:
             if tool.name not in {t.name for t in self.tools}:
                 self.tools.append(tool)
                 
-                # NEW: If we have a cassette, wrap the tool for replay
+                # If we have a cassette, wrap the tool for replay
                 if hasattr(self, 'cassette') and self.cassette:
                     original_func = tool.func
+                    tool_name = tool.name  # Capture in local scope
                     
-                    def replay_aware_tool_func(*args, **kwargs):
+                    @functools.wraps(original_func)
+                    def replay_aware_tool_func(*args, _orig_func=original_func, _tool_name=tool_name, **kwargs):
+                        """Wrapper that intercepts tool calls for replay."""
+                        # Extract cache if present (preserve original behavior)
+                        cache = kwargs.get('cache')
+                        
+                        # For replay, we only care about the actual tool args, not cache
+                        tool_args = {k: v for k, v in kwargs.items() if k != 'cache'}
+                        
                         # Try to get from cassette first
-                        replayed = self.cassette.intercept_tool_call(tool.name, kwargs)
+                        replayed = self.cassette.intercept_tool_call(_tool_name, tool_args)
                         if replayed is not None:
                             return replayed
                         
-                        # Make real call
-                        result = original_func(*args, **kwargs)
+                        # Make real call with ALL original kwargs (including cache)
+                        result = _orig_func(*args, **kwargs)
                         
-                        # Record for future replay
-                        self.cassette.record_tool_response(tool.name, kwargs, result)
+                        # Record for future replay (without cache in the key)
+                        self.cassette.record_tool_response(_tool_name, tool_args, result)
                         return result
                     
                     tool.func = replay_aware_tool_func
@@ -152,7 +159,6 @@ class Agent(ReplayableAgent):  # CHANGED: Now inherits from ReplayableAgent
                 EnhancedMemory(),
                 self.system_prompt
             )
-
         self.conversation.load_conversation(filepath)
 
     def get_audit_summary(self) -> Optional[Dict[str, Any]]:
@@ -187,7 +193,7 @@ class Agent(ReplayableAgent):  # CHANGED: Now inherits from ReplayableAgent
                 "reasoning_mode": reasoning_mode,
                 "use_cache": use_cache,
                 "system_prompt": self.system_prompt,
-                "replay_enabled": hasattr(self, 'cassette') and self.cassette is not None  # NEW
+                "replay_enabled": hasattr(self, 'cassette') and self.cassette is not None
             })
 
         # Initialize state with query
@@ -400,19 +406,10 @@ class Agent(ReplayableAgent):  # CHANGED: Now inherits from ReplayableAgent
                         cache_to_use = None if bypass_cache else active_cache
 
                         # Execute the tool (or get cached result)
+                        # FIXED: Removed duplicate cassette interception here
+                        # The tool wrapper in add_tools() handles cassette interception
                         tool_start_time = time.time()
-                        
-                        # NEW: Check cassette first if replay is enabled
-                        if hasattr(self, 'cassette') and self.cassette:
-                            replayed = self.cassette.intercept_tool_call(tool_name, tool_args)
-                            if replayed is not None:
-                                tool_result = replayed
-                            else:
-                                tool_result = tool(cache=cache_to_use, **tool_args)
-                                self.cassette.record_tool_response(tool_name, tool_args, tool_result)
-                        else:
-                            tool_result = tool(cache=cache_to_use, **tool_args)
-                        
+                        tool_result = tool(cache=cache_to_use, **tool_args)
                         tool_latency = time.time() - tool_start_time
 
                         # Record in tool call history to prevent repetition
@@ -689,11 +686,11 @@ class Agent(ReplayableAgent):  # CHANGED: Now inherits from ReplayableAgent
         # Update step in state
         self.state.set("execution.total_steps", step)
 
-        # NEW: Log replay stats if available
+        # Log replay stats if available
         if hasattr(self, 'cassette') and self.cassette:
             replay_stats = self.cassette.get_stats()
             if verbose:
-                print(f"📼 Replay stats: {replay_stats['hits']} hits, {replay_stats['misses']} misses")
+                print(f"📼 Replay stats - LLM: {replay_stats.get('llm_hits', 0)} hits/{replay_stats.get('llm_misses', 0)} misses, Tools: {replay_stats.get('tool_hits', 0)} hits/{replay_stats.get('tool_misses', 0)} misses")
 
         # Log run completion to audit trail if available
         if hasattr(self, 'audit_trail') and self.audit_trail:
@@ -702,7 +699,7 @@ class Agent(ReplayableAgent):  # CHANGED: Now inherits from ReplayableAgent
                 "steps_taken": step,
                 "duration": run_duration,
                 "token_usage": self.llm.get_token_usage(),
-                "replay_stats": self.get_replay_stats() if hasattr(self, 'cassette') else None  # NEW
+                "replay_stats": self.get_replay_stats() if hasattr(self, 'cassette') else None
             })
 
             # Save the audit trail to file if storage_path is set
@@ -720,17 +717,13 @@ class Agent(ReplayableAgent):  # CHANGED: Now inherits from ReplayableAgent
                 "trace": self.trace.format_trace(),
                 "unique_tool_results": self.memory.get_unique_tool_results(),
                 "state": self.state.to_dict(),
-                "audit_trail": self.audit_trail.get_summary() if hasattr(self,
-                                                                         'audit_trail') and self.audit_trail else None,
-                "replay_stats": self.get_replay_stats()  # NEW
+                "audit_trail": self.audit_trail.get_summary() if hasattr(self, 'audit_trail') and self.audit_trail else None,
+                "replay_stats": self.get_replay_stats()
             }
         else:
             # Return simple response and history
             return final_response, self.memory.history
 
-
-# The rest of the classes remain the same (ConversationalAgent, EnhancedAgent, etc.)
-# No changes needed for those classes
 
 class ConversationalAgent(Agent):
     """Agent specialized for multi-turn conversational interactions with audit trail support."""
