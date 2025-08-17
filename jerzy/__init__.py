@@ -7,14 +7,16 @@ from .llm import LLM, OpenAILLM, CustomOpenAILLM
 from .chain import Chain, ConversationChain
 from .agent import Agent, EnhancedAgent, ConversationalAgent, MultiAgentSystem, AgentRole, AgentMessage
 from .decorators import robust_tool, log_tool_call, with_fallback
+from .replay import Cassette, ReplayableAgent
 
 __all__ = [
-    "Prompt", "ToolCache", "State",
+    "Prompt", "ToolCache", "State", "Tool",
     "Memory", "EnhancedMemory",
-    "Trace", "AuditTrail", "LLM", "OpenAILLM",
+    "Trace", "AuditTrail", "Plan", "Planner",
+    "LLM", "OpenAILLM", "CustomOpenAILLM",
     "Chain", "ConversationChain",
-    "Agent", "EnhancedAgent",  "robust_tool", "log_tool_call", 
-    "with_fallback", "Tool", "CustomOpenAILLM",
-     "ConversationalAgent", "MultiAgentSystem",
-    "AgentRole", "AgentMessage", "Plan", "Planner"
+    "Agent", "EnhancedAgent", "ConversationalAgent", 
+    "MultiAgentSystem", "AgentRole", "AgentMessage",
+    "robust_tool", "log_tool_call", "with_fallback",
+    "Cassette", "ReplayableAgent"
 ]
